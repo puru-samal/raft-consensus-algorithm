@@ -1,15 +1,19 @@
 package raft
 
-import "github.com/cmu440/rpc"
-import "log"
-import "sync"
-import "testing"
-import "runtime"
-import crand "crypto/rand"
-import "encoding/base64"
-import "sync/atomic"
-import "time"
-import "fmt"
+import (
+	"log"
+	"runtime"
+	"sync"
+	"testing"
+
+	"github.com/cmu440/rpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
 
 //
 // Raft tests.
@@ -59,6 +63,69 @@ func TestReElection2A(t *testing.T) {
 	cfg.checkOneLeader()
 
 	fmt.Printf("======================= END =======================\n\n")
+
+}
+
+func TestReElectionHidden2A(t *testing.T) {
+	fmt.Printf("==================== 5 SERVERS ====================\n")
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Hidden Test (2A): election after network failure\n")
+
+	fmt.Printf("Basic 1 leader\n")
+	oldLeader := cfg.checkOneLeader()
+
+	// if the leader disconnects, a new one should be elected.
+	fmt.Printf("Disconnecting leader\n")
+	cfg.disconnect(oldLeader)
+
+	// a new leader should have been elected
+	fmt.Printf("Checking for a new leader\n")
+	newLeader := cfg.checkOneLeader()
+
+	fmt.Printf("Reconnecting old leader\n")
+	cfg.connect(oldLeader)
+
+	// waiting
+	fmt.Printf("Waiting a bit\n")
+	time.Sleep(RaftElectionTimeout)
+
+	// old leader should now be a follower
+	fmt.Printf("Checking current leader\n")
+	fmt.Printf("Leader unchanged: %v\n", newLeader == cfg.checkOneLeader())
+
+	// --
+	fmt.Printf("Disconnecting leader + two more peers\n")
+	cfg.disconnect((newLeader) % servers)
+	cfg.disconnect((newLeader + 1) % servers)
+	cfg.disconnect((newLeader + 2) % servers)
+	oldLeader = newLeader
+
+	// waiting
+	fmt.Printf("Waiting a bit\n")
+	time.Sleep(RaftElectionTimeout)
+
+	// no leader should be elected
+	fmt.Printf("Checking if there is no leader\n")
+	cfg.checkNoLeader()
+
+	fmt.Printf("Reconnecting disconnected peer\n")
+	cfg.connect((newLeader + 1) % servers)
+	cfg.connect((newLeader + 2) % servers)
+
+	fmt.Printf("Checking if there is a leader\n")
+	newLeader = cfg.checkOneLeader()
+
+	fmt.Printf("Reconnecting old disconnected leader\n")
+	cfg.connect(oldLeader)
+
+	fmt.Printf("Checking current leader\n")
+	fmt.Printf("Leader unchanged: %v\n", newLeader == cfg.checkOneLeader())
+
+	fmt.Printf("======================= END =======================\n\n")
+
 }
 
 func TestBasicAgree2B(t *testing.T) {
@@ -278,6 +345,135 @@ loop:
 	}
 
 	fmt.Printf("======================= END =======================\n\n")
+}
+
+func TestBackupHidden2B(t *testing.T) {
+	fmt.Printf("==================== 5 SERVERS ====================\n")
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Hidden Test (2B): leader backs up quickly over incorrect follower logs\n")
+
+	fmt.Printf("Checking agreement\n")
+	cfg.one(10, servers)
+
+	fmt.Printf("Putting leader and one follower in a partition\n")
+	oldLeader := cfg.checkOneLeader()
+	oldFollower := (oldLeader + 1) % servers
+	partition1 := make(IntSet)
+	partition2 := make(IntSet)
+	for i := 0; i < len(cfg.rafts); i++ {
+		if i == oldLeader || i == oldFollower {
+			partition1[i] = struct{}{}
+		}
+	}
+	for i := 0; i < len(cfg.rafts); i++ {
+		if !(i == oldLeader || i == oldFollower) {
+			partition2[i] = struct{}{}
+		}
+	}
+	cfg.disconnect_partition(partition1)
+
+	fmt.Printf("Submitting lots of commands to leader + follower partition which should not commit [20-50)\n")
+	for i := 2; i < 51; i++ {
+		cfg.rafts[oldLeader].PutCommand((i * 10))
+	}
+	time.Sleep(RaftElectionTimeout)
+
+	fmt.Printf("Disconnecting leader and follower\n")
+	cfg.disconnect(oldLeader)
+	cfg.disconnect(oldFollower)
+
+	fmt.Printf("Connnecting all peers except leader and follower\n")
+	cfg.connect_partition(partition2)
+
+	fmt.Printf("Submitting lots of commands to the new partition which should commit [50-80)\n")
+	for i := 51; i < 101; i++ {
+		cfg.one(i*10, servers-2)
+	}
+
+	fmt.Printf("Disconnecting a follower from the current partition\n")
+	newLeader := cfg.checkLeaderInPartition(partition2)
+	newFollower := -1
+	for p, _ := range partition2 {
+		if p != newLeader {
+			newFollower = p
+			delete(partition2, newFollower)
+			break
+		}
+	}
+	cfg.disconnect(newFollower)
+
+	fmt.Printf("There should one leader and one follower in this partition\n")
+
+	fmt.Printf("Submitting lots of commands to the new partition which should not commit [90-110)\n")
+	for i := 101; i < 151; i++ {
+		cfg.rafts[newLeader].PutCommand(i * 10)
+	}
+	time.Sleep(RaftElectionTimeout)
+
+	fmt.Printf("Disconnecting everyone\n")
+	cfg.disconnect_partition(partition2)
+
+	fmt.Printf("Reconnecting old leader and follower\n")
+	cfg.connect_partition(partition1)
+
+	fmt.Printf("Reconnecting new leader's disconnected follower\n")
+	cfg.connect(newFollower)
+
+	fmt.Printf("Submitting lots of commands to the new partition which should commit [120-160)\n")
+	for i := 151; i < 201; i++ {
+		cfg.one(i*10, servers-2)
+	}
+	fmt.Printf("Connnecting everyone\n")
+	cfg.connect_partition(partition2)
+
+	fmt.Printf("Checking agreement\n")
+	cfg.one(201, servers)
+}
+
+func TestRejoinHidden2B(t *testing.T) {
+	fmt.Printf("==================== 5 SERVERS ====================\n")
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Println("Hidden Test (2B): rejoin of partitioned leader")
+
+	fmt.Println("Checking agreement")
+	cfg.one(10, servers)
+
+	fmt.Println("Disconnecting leader")
+	oldLeader := cfg.checkOneLeader()
+	cfg.disconnect(oldLeader)
+
+	fmt.Println("Sending 3 commands to disconnected leader")
+	for i := 2; i < 5; i++ {
+		cfg.rafts[oldLeader].PutCommand(i * 10)
+	}
+
+	fmt.Println("Checking agreement for new leader")
+	//time.Sleep(RaftElectionTimeout)
+	cfg.one(50, servers-1)
+
+	fmt.Println("Disconnecting new leader")
+	newLeader := cfg.checkOneLeader()
+	cfg.disconnect(newLeader)
+
+	fmt.Println("Connecting first disconnected leader")
+	cfg.connect(oldLeader)
+
+	fmt.Println("Checking agreement")
+	//time.Sleep(RaftElectionTimeout)
+	cfg.one(60, servers-1)
+
+	fmt.Println("Connecting second disconnected leader")
+	cfg.connect(newLeader)
+
+	fmt.Println("Checking agreement")
+	//time.Sleep(RaftElectionTimeout)
+	cfg.one(70, servers)
 }
 
 //
