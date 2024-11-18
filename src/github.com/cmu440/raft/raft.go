@@ -105,9 +105,8 @@ type Raft struct {
 	heartbeatTimer *time.Timer // becomes non-nil when a server becomes a leader [100ms]
 
 	// Channels -----------------------------------------------------------------------------------
-	applyCh       chan ApplyCommand // channel to send commited log entries to
-	applyNotifyCh chan int          // channel to notify that a log entry is available to commit
-	rpcInfoCh     chan *RPCInfo     // channel to send state information during rpc calls/responses to manage server state
+	applyCh   chan ApplyCommand // channel to send commited log entries to
+	rpcInfoCh chan *RPCInfo     // channel to send state information during rpc calls/responses to manage server state
 }
 
 // GetState
@@ -286,18 +285,15 @@ type AppendEntriesArgs struct {
 // ===============
 // # Please note: Field names must start with capital letters
 type AppendEntriesReply struct {
-	Term          int  // currentTerm for leader to update itself
-	Success       bool // true if follower contained entry matching prevLogIdc and prevLogTerm
-	ConflictTerm  int  // term of conflicting entry (-1 if none)
-	ConflictIndex int  // first index storing conflict term
+	Term    int  // currentTerm for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIdc and prevLogTerm
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mux.Lock()
 
-	rf.logger.Printf("%s: %s\n", rf.String(), StringifyAppendEntriesArgs(args))
-
 	reply.Term = rf.currentTerm
+	rf.logger.Printf("%s: %s\n", rf.String(), StringifyAppendEntriesArgs(args))
 	// 1. reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -319,60 +315,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	if len(rf.log) <= args.PrevLogIdx || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
 		reply.Success = false
-		rf.logger.Printf("success: %v\n", reply.Success)
-		// Optimization: Collect information about the conflicting term
-		if len(rf.log) > args.PrevLogIdx {
-
-			// Find the first index of the conflicting term
-			conflictTerm := rf.log[args.PrevLogIdx].Term
-			firstIndexOfConflictTerm := args.PrevLogIdx
-			for firstIndexOfConflictTerm > 0 && rf.log[firstIndexOfConflictTerm-1].Term == conflictTerm {
-				firstIndexOfConflictTerm--
-			}
-			reply.ConflictTerm = conflictTerm
-			reply.ConflictIndex = firstIndexOfConflictTerm
-
-		} else {
-			// There's no entry at PrevLogIdx, so the conflict is with a missing entry
-			reply.ConflictTerm = -1 // Indicating no specific term found
-			reply.ConflictIndex = len(rf.log)
-		}
+		rf.logger.Printf("%s : success: %v\n", rf.String(), reply.Success)
 		rf.mux.Unlock()
 		return
 	}
 
+	// matching upto rf.log[args.PrevLogIdx]
 	// len(rf.log) > args.PrevLogIdx && rf.log[args.PrevLogIdx].Term == args.PrevLogTerm
 	// 3. If an existing entry conflicts with a new one (same index but different terms),
 	// delete the existing entry and all that follow it
-	for i, newEntry := range args.Entries {
-		idx := args.PrevLogIdx + 1 + i
-		if idx < len(rf.log) {
-			// If there's a conflict in terms, delete the existing entry and all that follow it
-			if rf.log[idx].Term != newEntry.Term {
-				rf.log = rf.log[:idx]
-				break
-			}
-		}
-	}
-
 	// 4. Append any new entries not already in the log
 	for i, newEntry := range args.Entries {
 		idx := args.PrevLogIdx + 1 + i
-		// Append new entries if they are not already in the log
-		if idx >= len(rf.log) {
+		if idx < len(rf.log) {
+			// Conflict detected: same index but different terms
+			if rf.log[idx].Term != newEntry.Term {
+				// Truncate log from this point
+				rf.log = rf.log[:idx]
+				// Append the conflicting and subsequent new entries from args.Entries
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+		} else {
+			// The log is shorter than the entries we're trying to append; directly append remaining entries
 			rf.log = append(rf.log, newEntry)
 		}
 	}
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-		lastNewEntryIdx := len(rf.log) - 1
+		lastNewEntryIdx := 0
 		if len(args.Entries) == 0 {
 			lastNewEntryIdx = args.PrevLogIdx
+		} else {
+			lastNewEntryIdx = len(rf.log) - 1
 		}
 		rf.commitIndex = min(args.LeaderCommit, lastNewEntryIdx)
 	}
-
 	rf.mux.Unlock()
 
 	rType := AppendEntriesRequest
@@ -384,15 +363,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.rpcInfoCh <- info
-
-	// If commitIndex > lastApplied:
-	// increment lastApplied,
-	// apply log[lastApplied] to state machine
-	select {
-	case rf.applyNotifyCh <- 1:
-	default:
-		// If the channel is full, don't block
-	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -407,17 +377,52 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.votedFor = -1
 			termChange = true
 		}
-		rf.mux.Unlock()
-		info := &RPCInfo{
-			rType:           AppendEntriesResponse,
-			termChange:      termChange,
-			success:         reply.Success,
-			requestorID:     server,
-			appendEntryArgs: args,
-			conflictTerm:    reply.ConflictTerm,
-			conflictIndex:   reply.ConflictIndex,
+
+		if termChange {
+			info := &RPCInfo{
+				rType:       AppendEntriesResponse,
+				termChange:  termChange,
+				success:     reply.Success,
+				requestorID: server,
+			}
+			rf.rpcInfoCh <- info
+			rf.mux.Unlock()
+			return ok
 		}
-		rf.rpcInfoCh <- info
+
+		if !(rf.state == Leader) {
+			rf.mux.Unlock()
+			return ok
+		}
+
+		// if successful, update nextIndex, matchIndex
+		// else decrement nextIndex and retry
+		if reply.Success {
+			// If successful: update nextIndex and matchIndex for follower
+			rf.logger.Printf("%s : %s:%d -> success!\n", rf.String(), StringifyRPCType(AppendEntriesResponse), server)
+			rf.matchIndex[server] = args.PrevLogIdx + len(args.Entries)
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+			rf.updateCommitIndex()
+		} else {
+			rf.logger.Printf("%s : %s:%d -> fail!\n", rf.String(), StringifyRPCType(AppendEntriesResponse), server)
+			// If AppendEntries fails because of log inconsistency:
+			// decrement nextIndex and retry
+			rf.nextIndex[server]--
+			rf.nextIndex[server] = max(rf.nextIndex[server], 1)
+			// retry
+			idx := rf.nextIndex[server]
+			args := &AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderID:     rf.me,
+				PrevLogIdx:   idx - 1,
+				PrevLogTerm:  rf.log[idx-1].Term,
+				Entries:      rf.log[idx:],
+				LeaderCommit: rf.commitIndex,
+			}
+			reply := &AppendEntriesReply{}
+			go rf.sendAppendEntries(server, args, reply)
+		}
+		rf.mux.Unlock()
 	}
 	return ok
 }
@@ -445,6 +450,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 	// TODO - Your code here (2B)
 	rf.mux.Lock()
+	rf.logger.Printf("PutCommand: me:%s, Cmd:%v", rf.String(), command)
 	index := len(rf.log)
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
@@ -516,11 +522,10 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 		log: []*LogEntry{
 			{Command: 0, Term: 0},
 		},
-		commitIndex:   0,
-		lastApplied:   0,
-		nextIndex:     nil,
-		matchIndex:    nil,
-		applyNotifyCh: make(chan int, 1),
+		commitIndex: 0,
+		lastApplied: 0,
+		nextIndex:   nil,
+		matchIndex:  nil,
 	}
 	rf.peers = peers
 	rf.me = me

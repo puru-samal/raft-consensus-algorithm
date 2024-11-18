@@ -32,14 +32,11 @@ const (
 // struct with the goal is to encode enough information
 // to make all state changes possible in a centralized manner.
 type RPCInfo struct {
-	rType           RPCType
-	requestorID     int
-	termChange      bool
-	voteGranted     bool
-	success         bool
-	appendEntryArgs *AppendEntriesArgs
-	conflictTerm    int
-	conflictIndex   int
+	rType       RPCType
+	requestorID int
+	termChange  bool
+	voteGranted bool
+	success     bool
 }
 
 // Server -------------------------------------------------------------------------------------------------------
@@ -209,6 +206,7 @@ func (rf *Raft) runLeader() {
 	rf.leaderInit()
 	// Upon election, send heartbeats to each server
 	rf.sendHeartbeats()
+	rf.Replicate()
 	rf.resetTimers()
 
 	for {
@@ -218,7 +216,7 @@ func (rf *Raft) runLeader() {
 			rf.mux.Lock()
 			rf.logger.Printf("%s : SendHeartbeats\n", rf.String())
 			rf.mux.Unlock()
-			rf.sendHeartbeats()
+			rf.HeartbeatOrReplicate()
 			rf.resetTimers()
 
 		case info := <-rf.rpcInfoCh:
@@ -236,52 +234,7 @@ func (rf *Raft) runLeader() {
 			}
 			switch info.rType {
 
-			case AppendEntriesResponse:
-				if info.success {
-					// If successful: update nextIndex and matchIndex for follower
-					rf.logger.Printf("%s : %s:%d -> success!\n", rf.String(), StringifyRPCType(info.rType), info.requestorID)
-					lastEntryIndex := info.appendEntryArgs.PrevLogIdx + len(info.appendEntryArgs.Entries)
-					rf.nextIndex[info.requestorID] = lastEntryIndex + 1
-					rf.matchIndex[info.requestorID] = lastEntryIndex
-					// Attempt to update the commit index based on the updated matchIndex
-					if len(info.appendEntryArgs.Entries) != 0 {
-						rf.updateCommitIndex()
-					}
-
-				} else {
-					rf.logger.Printf("%s : %s:%d -> fail!\n", rf.String(), StringifyRPCType(info.rType), info.requestorID)
-					// If AppendEntries fails because of log inconsistency:
-					// use conflict term to decrement nextIndex and retry
-					if info.conflictTerm != -1 {
-						// If the follower provided a conflict term, adjust nextIndex
-						newNextIndex := info.conflictIndex
-						for i := info.conflictIndex - 1; i >= 0; i-- {
-							if info.conflictTerm > rf.log[i].Term {
-								newNextIndex = i + 1
-								break
-							}
-						}
-						rf.nextIndex[info.requestorID] = newNextIndex
-					} else {
-						rf.nextIndex[info.requestorID] = info.conflictIndex
-					}
-					// retry
-					if len(rf.log)-1 >= rf.nextIndex[info.requestorID] {
-						idx := max(rf.nextIndex[info.requestorID]-1, 0)
-						args := &AppendEntriesArgs{
-							Term:         rf.currentTerm,
-							LeaderID:     rf.me,
-							PrevLogIdx:   idx,
-							PrevLogTerm:  rf.log[idx].Term,
-							Entries:      rf.log[idx+1:],
-							LeaderCommit: rf.commitIndex,
-						}
-						reply := &AppendEntriesReply{}
-						go rf.sendAppendEntries(info.requestorID, args, reply)
-					}
-				}
-
-			case AppendEntriesRequest, RequestVoteRequest, RequestVoteResponse:
+			case AppendEntriesResponse, AppendEntriesRequest, RequestVoteRequest, RequestVoteResponse:
 				// invalid requests with term = Current term, reject
 				rf.logger.Printf("%s : Ignored:%s", rf.String(), StringifyRPCType(info.rType))
 			}
@@ -311,12 +264,12 @@ func (rf *Raft) sendHeartbeats() {
 	defer rf.mux.Unlock()
 	for i := range rf.peers {
 		if i != rf.me {
-			idx := max(rf.nextIndex[i]-1, 0)
+			nextIndex := max(rf.nextIndex[i], 0)
 			args := &AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderID:     rf.me,
-				PrevLogIdx:   idx,
-				PrevLogTerm:  rf.log[idx].Term,
+				PrevLogIdx:   nextIndex - 1,
+				PrevLogTerm:  rf.log[nextIndex-1].Term,
 				Entries:      make([]*LogEntry, 0),
 				LeaderCommit: rf.commitIndex,
 			}
@@ -340,13 +293,48 @@ func (rf *Raft) updateCommitIndex() {
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = n
 			rf.logger.Printf("%s : updating commitIndex: %d\n", rf.String(), rf.commitIndex)
-			// Signal the apply goroutine to process the new committed entries
-			select {
-			case rf.applyNotifyCh <- 1:
-			default:
-				// If the channel is full, don't block
-			}
 			break
+		}
+	}
+}
+
+// after the initial heartbeat append entries
+// server alternates between sending heartbeats or
+// AppendEntries based on if len(rf.log)-1 >= rf.nextIndex[i]
+func (rf *Raft) HeartbeatOrReplicate() {
+	rf.mux.Lock()
+	defer rf.mux.Unlock()
+	if rf.state == Leader {
+		for i := range rf.peers {
+			if i != rf.me {
+				// If last log index ≥ nextIndex for a follower:
+				// send AppendEntries RPC with log entries starting at nextIndex
+				if len(rf.log)-1 >= rf.nextIndex[i] {
+					nextIndex := max(rf.nextIndex[i], 0)
+					args := &AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderID:     rf.me,
+						PrevLogIdx:   nextIndex - 1,
+						PrevLogTerm:  rf.log[nextIndex-1].Term,
+						Entries:      rf.log[nextIndex:],
+						LeaderCommit: rf.commitIndex,
+					}
+					reply := &AppendEntriesReply{}
+					go rf.sendAppendEntries(i, args, reply)
+				} else {
+					nextIndex := max(rf.nextIndex[i], 0)
+					args := &AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderID:     rf.me,
+						PrevLogIdx:   nextIndex - 1,
+						PrevLogTerm:  rf.log[nextIndex-1].Term,
+						Entries:      make([]*LogEntry, 0),
+						LeaderCommit: rf.commitIndex,
+					}
+					reply := &AppendEntriesReply{}
+					go rf.sendAppendEntries(i, args, reply)
+				}
+			}
 		}
 	}
 }
@@ -363,13 +351,13 @@ func (rf *Raft) Replicate() {
 				// If last log index ≥ nextIndex for a follower:
 				// send AppendEntries RPC with log entries starting at nextIndex
 				if len(rf.log)-1 >= rf.nextIndex[i] {
-					idx := max(rf.nextIndex[i]-1, 0)
+					nextIndex := max(rf.nextIndex[i], 0)
 					args := &AppendEntriesArgs{
 						Term:         rf.currentTerm,
 						LeaderID:     rf.me,
-						PrevLogIdx:   idx,
-						PrevLogTerm:  rf.log[idx].Term,
-						Entries:      rf.log[idx+1:],
+						PrevLogIdx:   nextIndex - 1,
+						PrevLogTerm:  rf.log[nextIndex-1].Term,
+						Entries:      rf.log[nextIndex:],
 						LeaderCommit: rf.commitIndex,
 					}
 					reply := &AppendEntriesReply{}
@@ -382,24 +370,29 @@ func (rf *Raft) Replicate() {
 
 // State Machine ------------------------------------------------------------------------------------------------
 
-// helper function that is launched as a goroutine to send commands to a client
+// helper function that is launched as a goroutine to periotically apply to state machine
 // If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
 func (rf *Raft) runApply() {
 	for {
-		<-rf.applyNotifyCh // Block until notified
 		rf.mux.Lock()
-		for rf.commitIndex > rf.lastApplied {
-			rf.lastApplied += 1
-			rf.logger.Printf("%s : Apply: lastApplied: %d, commitIndex: %d\n", rf.String(), rf.lastApplied, rf.commitIndex)
-			command := ApplyCommand{
-				Index:   rf.lastApplied,
-				Command: rf.log[rf.lastApplied].Command,
-			}
+
+		// Wait until there's something new to apply
+		if rf.commitIndex <= rf.lastApplied {
 			rf.mux.Unlock()
-			rf.applyCh <- command
-			rf.mux.Lock()
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
+
+		// Apply all pending commands in order
+		rf.lastApplied += 1
+		rf.logger.Printf("%s : Apply: lastApplied: %d, commitIndex: %d\n", rf.String(), rf.lastApplied, rf.commitIndex)
+		command := ApplyCommand{
+			Index:   rf.lastApplied,
+			Command: rf.log[rf.lastApplied].Command,
+		}
+
 		rf.mux.Unlock()
+		rf.applyCh <- command
 	}
 }
 
@@ -537,8 +530,8 @@ func StringifyRPCType(t RPCType) string {
 
 // string representation of a raft server
 func (rf *Raft) String() string {
-	//str := fmt.Sprintf("[me:%d, term:%d, state:%s, votedFor:%d, commitIdx:%d, logs:%s]", rf.me, rf.currentTerm, rf.stateToStr(), rf.votedFor, rf.commitIndex, StringifyLogEntries(rf.log))
-	str := fmt.Sprintf("[me:%d, term:%d, state:%s, votedFor:%d, commitIdx:%d]", rf.me, rf.currentTerm, rf.StringifyState(), rf.votedFor, rf.commitIndex)
+	str := fmt.Sprintf("[me:%d, term:%d, state:%s, votedFor:%d, commitIdx:%d, logs:%s]", rf.me, rf.currentTerm, rf.StringifyState(), rf.votedFor, rf.commitIndex, StringifyLogEntries(rf.log))
+	//str := fmt.Sprintf("[me:%d, term:%d, state:%s, commitIdx:%d]", rf.me, rf.currentTerm, rf.StringifyState(), rf.commitIndex)
 	return str
 
 }
